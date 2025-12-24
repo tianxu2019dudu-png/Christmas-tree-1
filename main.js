@@ -132,6 +132,8 @@ if (!videoEl) {
             console.log('Video loadeddata; readyState=', videoEl.readyState);
             const loadingEl = document.getElementById('loading');
             if (loadingEl) loadingEl.style.display = 'none';
+            // create Three.js video texture now that frames are available
+            createVideoTextureIfNeeded();
         });
 
         videoEl.addEventListener('error', (ev) => {
@@ -155,6 +157,7 @@ if (!videoEl) {
         videoEl.addEventListener('playing', () => {
             hideVideoLoading();
             STATE.isPlayingVideo = true;
+            createVideoTextureIfNeeded();
         });
         videoEl.addEventListener('pause', () => {
             STATE.isPlayingVideo = false;
@@ -426,33 +429,50 @@ const starPoints = new THREE.Points(starGeo, starMaterial);
 scene.add(starPoints);
 const ORIGINAL_STAR_SIZE = starMaterial.size;
 
+
 /**
  * VIDEO PLANE
+ *
+ * Create the plane immediately but defer creating the THREE.VideoTexture
+ * until the <video> element has actual frame data. This avoids WebGL
+ * errors when `texImage2D` is called with an empty/invalid video source.
  */
-const videoTexture = new THREE.VideoTexture(videoEl);
-videoTexture.minFilter = THREE.LinearFilter;
-videoTexture.magFilter = THREE.LinearFilter;
-videoTexture.generateMipmaps = false;
-// Try to use the maximum anisotropy available to keep the video crisp when scaled
-const maxAniso = (renderer.capabilities && typeof renderer.capabilities.getMaxAnisotropy === 'function') ? renderer.capabilities.getMaxAnisotropy() : (renderer.capabilities ? renderer.capabilities.maxAnisotropy || 0 : 0);
-if (maxAniso) videoTexture.anisotropy = maxAniso;
-
+let videoTexture = null;
 const videoGeo = new THREE.PlaneGeometry(4, 2.25); // 16:9 aspect ratio
 const videoMat = new THREE.MeshBasicMaterial({ 
-    map: videoTexture, 
+    map: null, 
+    color: new THREE.Color(1, 1, 1),
     side: THREE.DoubleSide,
     transparent: true,
     opacity: 0,
     depthWrite: false // do not write to depth so particles can be rendered on top
 });
 const videoPlane = new THREE.Mesh(videoGeo, videoMat);
-// Start the video plane slightly behind the particle system; bring forward when showing
 videoPlane.position.set(0, 0, -5);
 scene.add(videoPlane);
-
-// Ensure render order so we can bring the video plane in front when needed
 videoPlane.renderOrder = 0;
 particleSystem.renderOrder = 1;
+
+function createVideoTextureIfNeeded() {
+    try {
+        if (!videoEl) return;
+        if (videoTexture) return; // already created
+        // Only create the VideoTexture if the element reports having data
+        if (videoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+            videoTexture = new THREE.VideoTexture(videoEl);
+            videoTexture.minFilter = THREE.LinearFilter;
+            videoTexture.magFilter = THREE.LinearFilter;
+            videoTexture.generateMipmaps = false;
+            const maxAniso = (renderer.capabilities && typeof renderer.capabilities.getMaxAnisotropy === 'function') ? renderer.capabilities.getMaxAnisotropy() : (renderer.capabilities ? renderer.capabilities.maxAnisotropy || 0 : 0);
+            if (maxAniso) videoTexture.anisotropy = maxAniso;
+            videoPlane.material.map = videoTexture;
+            videoPlane.material.needsUpdate = true;
+            console.log('Created THREE.VideoTexture from video element');
+        }
+    } catch (e) {
+        console.warn('Could not create VideoTexture yet:', e);
+    }
+}
 
 // When the video's metadata loads, resize the plane to match the native aspect
 videoEl.addEventListener('loadedmetadata', () => {
@@ -625,7 +645,28 @@ const mediaCamera = (function(){
 
             frameLoop();
         } catch (err) {
-            // Propagate so callers can handle (we already wrap mediaCamera.start() elsewhere)
+            const loadingEl = document.getElementById('loading');
+            // Handle permission denied / not allowed gracefully: fall back to local video
+            if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.name === 'SecurityError')) {
+                console.warn('Camera permission denied or not allowed:', err);
+                if (loadingEl) {
+                    loadingEl.style.display = 'block';
+                    loadingEl.textContent = 'Camera access was denied. Using local video fallback.';
+                }
+                // Attempt to play the provided local video as a graceful fallback
+                try {
+                    if (videoEl) {
+                        videoEl.muted = !userInteracted;
+                        const p = videoEl.play();
+                        if (p && p.then) p.catch(() => {});
+                        createVideoTextureIfNeeded();
+                    }
+                } catch (e) {
+                    console.warn('Failed to autoplay local video fallback:', e);
+                }
+                return; // don't rethrow; caller will continue without camera
+            }
+            // Propagate other errors so higher-level handlers can display them
             throw err;
         }
     }
@@ -839,8 +880,8 @@ function animate() {
     videoPlane.position.z = THREE.MathUtils.lerp(videoPlane.position.z, targetZ, 0.06);
 
     // Ensure the video texture updates while playing so it appears
-    if (typeof videoTexture !== 'undefined' && videoEl && !videoEl.paused) {
-        videoTexture.needsUpdate = true;
+    if (videoTexture && videoEl && videoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !videoEl.paused) {
+        try { videoTexture.needsUpdate = true; } catch (e) { /* ignore texture update errors */ }
 
         // Fallback stutter detection: if currentTime isn't advancing for a short period,
         // show the loading indicator to indicate buffering or network issues.
